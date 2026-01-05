@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="tscodescan",
-    version="0.1.0",
+    version="0.1.1",
     description="AI-friendly directory and code scanner with tree-first output",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
