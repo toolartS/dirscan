@@ -93,7 +93,7 @@ Isi artifact:
 
 ---
 
-## Doctor Mode (`-d`)
+## Diagnose Mode (`-d`)
 
 ```bash
 tsc -d [path]
