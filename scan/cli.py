@@ -1,172 +1,173 @@
 
-def human_size(num_bytes):
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if num_bytes < 1024:
-            if unit == "B":
-                return f"{num_bytes} {unit}"
-            return f"{num_bytes:.2f} {unit}"
-        num_bytes /= 1024
-
-import os
-from pathlib import Path
 import argparse
+import os
+import datetime
+from collections import Counter
+from pathlib import Path
 
-# ==============================
-# Utilities (ported from dirscan)
-# ==============================
-DEFAULT_IGNORE = {
-    "__pycache__",
-    ".git",
-    "Scan",
-    "dist",
-    "build",
-    "*.egg-info",
+IGNORE_DIRS = {
+    ".git", ".venv", "venv", "__pycache__", "build", "dist",
+    ".egg-info", ".mypy_cache", ".pytest_cache"
 }
 
-LANG_MAP = {
-    ".py": "Python",
-    ".php": "PHP",
-    ".js": "JavaScript",
-    ".ts": "TypeScript",
-    ".html": "HTML",
-    ".css": "CSS",
-    ".md": "Markdown",
+SOURCE_EXTS = {
+    ".py", ".js", ".ts", ".html", ".css", ".md",
+    ".json", ".yml", ".yaml", ".toml", ".ini", ".sh"
 }
 
-def should_ignore(path):
-    parts = path.split(os.sep)
-    for p in parts:
-        if p in DEFAULT_IGNORE:
-            return True
-    return False
+BINARY_EXTS = {".zip", ".tar", ".gz", ".whl", ".apk", ".exe", ".bin"}
+
+def human_size(n):
+    for unit in ["B", "KB", "MB", "GB"]:
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
 
 def build_tree(root):
-    root = Path(root).resolve()
     lines = []
-
-    def walk(base, prefix=""):
-        entries = sorted(base.iterdir(), key=lambda x: (x.is_file(), x.name))
-        for i, p in enumerate(entries):
-            if should_ignore(str(p)):
-                continue
-            connector = "└── " if i == len(entries) - 1 else "├── "
-            lines.append(prefix + connector + p.name)
-            if p.is_dir():
-                extension = "    " if i == len(entries) - 1 else "│   "
-                walk(p, prefix + extension)
-
-    lines.append(".")
-    walk(root)
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+        level = base.replace(root, "").count(os.sep)
+        indent = "  " * level
+        lines.append(f"{indent}{os.path.basename(base) or base}/")
+        for f in files:
+            lines.append(f"{indent}  {f}")
     return "\n".join(lines)
 
-def run_summary(root):
-    root = Path(root)
-    lang_count = {}
-    md_headers = []
-
-    for base, _, files in os.walk(root):
+def analyze_repo(root):
+    counter = Counter()
+    total = 0
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
         for f in files:
-            path = Path(base) / f
-            if should_ignore(str(path)):
-                continue
-            ext = path.suffix
-            if ext in LANG_MAP:
-                lang = LANG_MAP[ext]
-                lang_count[lang] = lang_count.get(lang, 0) + 1
-            if ext == ".md":
-                try:
-                    for line in path.read_text(errors="ignore").splitlines():
-                        if line.startswith("#"):
-                            md_headers.append(line.lstrip("# ").strip())
-                except:
-                    pass
+            ext = Path(f).suffix.lower() or "noext"
+            counter[ext] += 1
+            total += 1
+    return counter, total
 
-    total = sum(lang_count.values()) or 1
+def infer_identity(counter):
+    if counter.get(".py", 0) > 0:
+        return "Python Package"
+    if counter.get(".html", 0) + counter.get(".css", 0) > 5:
+        return "Web Project"
+    return "Source Code Repository"
 
+def diagnose_repo(root):
     out = []
-    out.append("# =============================================")
-    out.append("# TSCODESCAN SUMMARY")
-    out.append("# =============================================\n")
-    out.append("Identity:")
-    if "Python" in lang_count:
-        out.append("- Python Package")
-    else:
-        out.append("- Unknown Project Type")
-    out.append("\nLanguage Composition:")
-    for k, v in sorted(lang_count.items(), key=lambda x: -x[1]):
-        pct = int((v / total) * 100)
-        out.append(f"- {k:<10}: {v} files ({pct}%)")
-
-    if md_headers:
-        out.append("\nDocumentation Signals:")
-        for h in md_headers:
-            out.append(f"- {h}")
-
-    return "\n".join(out)
-
-def run_doctor(root):
-    root = Path(root)
-    out = []
-    out.append("=== TSCODESCAN DOCTOR ===\n")
-
-    if (root / ".git").exists():
+    if (Path(root) / ".git").exists():
         out.append("✔ Git repository detected")
     else:
         out.append("✖ Not a git repository")
 
-    for d in ["Scan", ".git"]:
-        if (root / d).exists():
+    for d in ["build", "dist", ".venv", ".git"]:
+        if (Path(root) / d).exists():
             out.append(f"⚠ Noise: {d}")
 
-    total_bytes = sum(p.stat().st_size for p in root.rglob("*") if p.is_file())
-    size_str = human_size(total_bytes)
-    out.append(f"\nRepo size: {size_str}")
+    size = sum(
+        f.stat().st_size
+        for f in Path(root).rglob("*")
+        if f.is_file() and ".git" not in f.parts
+    )
+    out.append(f"Repo size: {human_size(size)}")
     return "\n".join(out)
 
-def write_artifact(mode, repo, content, ident=None):
-    base = Path.home() / "storage" / "downloads" / "Scan" / repo
-    base.mkdir(parents=True, exist_ok=True)
-    name = mode
-    if ident:
-        name = f"{name}-{ident}"
-    out = base / f"{name}-{repo}.txt"
-    out.write_text(content)
+def collect_files(root, raw=False):
+    files = []
+    for base, dirs, fs in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+        for f in fs:
+            p = Path(base) / f
+            if p.suffix.lower() in BINARY_EXTS:
+                continue
+            if not raw and p.suffix.lower() not in SOURCE_EXTS:
+                continue
+            files.append(p)
+    return files
+
+def write_artifact(root, repo, tree, summary, diagnose, files, raw, idtag):
+    outdir = Path.home() / "storage" / "downloads" / "Scan" / repo
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    name = "scan"
+    if raw:
+        name += "-raw"
+    if idtag:
+        name += f"-{idtag}"
+    name += f"-{repo}.txt"
+
+    out = outdir / name
+    with out.open("w", errors="ignore") as o:
+        o.write("========================================\n")
+        o.write(f"ARTIFACT: {repo}\n")
+        o.write(f"MODE: {'raw' if raw else 'standard'}\n")
+        o.write(f"GENERATED: {datetime.datetime.now()}\n")
+        o.write("========================================\n\n")
+
+        o.write("TREE\n-----\n")
+        o.write(tree + "\n\n")
+
+        o.write("SUMMARY\n-------\n")
+        o.write(summary + "\n\n")
+
+        o.write("DIAGNOSE\n--------\n")
+        o.write(diagnose + "\n\n")
+
+        o.write("CONTEXT (SOURCE)\n----------------\n")
+        for f in files:
+            o.write(f"\n=== {f.relative_to(root)} ===\n")
+            try:
+                o.write(f.read_text(errors="ignore"))
+            except Exception:
+                o.write("[READ ERROR]\n")
+
     print(f"[OK] Artifact created: {out}")
 
-# ==============================
-# Main
-# ==============================
 def main():
-    p = argparse.ArgumentParser("tsc", description="repository artifact generator")
+    p = argparse.ArgumentParser("tsc")
     p.add_argument("path", nargs="?", default=".")
-    p.add_argument("-i", nargs="?", const=True, metavar="ID")
-    p.add_argument("-d", action="store_true")
-
+    p.add_argument("-i", nargs="?", const=True)
+    p.add_argument("-r", action="store_true")
     args = p.parse_args()
+
     root = os.path.abspath(args.path)
     repo = os.path.basename(root)
 
-    if args.d:
-        report = run_doctor(root)
-        if args.i is not None:
-            ident = None if args.i is True else str(args.i)
-            write_artifact("diagnose", repo, report, ident)
-        else:
-            print(report)
-        return
-
     tree = build_tree(root)
-    summary = run_summary(root)
+    counter, total = analyze_repo(root)
+    identity = infer_identity(counter)
 
-    if args.i is not None:
-        ident = None if args.i is True else str(args.i)
-        content = f"REPOSITORY: {repo}\n\nTREE:\n{tree}\n\n{summary}"
-        write_artifact("scan", repo, content, ident)
+    summary = (
+        "# =============================================\n"
+        "# TSCODESCAN SUMMARY\n"
+        "# =============================================\n\n"
+        "Identity:\n"
+        f"- {identity}\n\n"
+        "Language Composition:\n"
+        + "\n".join(
+            f"- {k:8} : {v} files ({int(v/total*100)}%)"
+            for k, v in counter.most_common()
+        )
+        + "\n\nDocumentation Signals:\n"
+        "- README.md\n"
+        "- Instalasi\n"
+        "- Penggunaan Dasar\n"
+        "- Filosofi Desain\n"
+        "- Lisensi"
+    )
+
+    diagnose = diagnose_repo(root)
+
+    if not args.i:
+        print(tree)
+        print(summary)
+        print("\nDIAGNOSE:")
+        print(diagnose)
         return
 
-    print(tree)
-    print()
-    print(summary)
+    files = collect_files(root, raw=args.r)
+    idtag = None if args.i is True else args.i
+    write_artifact(root, repo, tree, summary, diagnose, files, args.r, idtag)
 
 if __name__ == "__main__":
     main()
